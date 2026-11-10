@@ -31,6 +31,10 @@ struct State {
     uintptr_t sym_field_get_name = 0;
     uintptr_t sym_class_get_name = 0;
     uintptr_t sym_class_get_namespace = 0;
+    uintptr_t sym_class_get_type = 0;
+    uintptr_t sym_type_get_name = 0;
+    uintptr_t sym_free = 0;
+    uintptr_t sym_image_get_name = 0;
     bool ready = false;
 };
 
@@ -145,101 +149,142 @@ bool read_ns_name(pid_t pid, uintptr_t klass, char *ns, size_t nsn, char *name, 
 
 bool call_cstr(RemoteSession &s, uintptr_t fn, uintptr_t arg, char *buf, size_t n);
 
-bool name_hit(const char *name, const char *ns, const std::string &wantNs, const std::string &wantCls,
-              const std::string &wantFull) {
-    if (!name || !name[0]) return false;
-    if (eq_ci(name, wantFull) || eq_ci(name, wantCls)) {
-        if (!wantNs.empty() && ns && ns[0] && !eq_ci(ns, wantNs)) return false;
-        return true;
+bool contains_ci(const std::string &hay, const std::string &needle) {
+    if (needle.empty() || hay.size() < needle.size()) return false;
+    for (size_t i = 0; i + needle.size() <= hay.size(); ++i) {
+        bool ok = true;
+        for (size_t j = 0; j < needle.size(); ++j) {
+            if (std::tolower((unsigned char)hay[i + j]) != std::tolower((unsigned char)needle[j])) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) return true;
     }
-    std::string full = (ns && ns[0]) ? std::string(ns) + "." + name : std::string(name);
-    if (eq_ci(full.c_str(), wantFull) || eq_ci(full.c_str(), wantCls)) return true;
-    for (char &c : full)
-        if (c == '/' || c == '+') c = '.';
-    return eq_ci(full.c_str(), wantFull);
+    return false;
 }
 
-bool class_matches(RemoteSession &s, uintptr_t klass, const std::string &wantNs,
-                   const std::string &wantCls, const std::string &wantFull) {
-    char name[128] = {};
-    char ns[128] = {};
-    if (g.sym_class_get_name &&
-        call_cstr(s, g.sym_class_get_name, klass, name, sizeof(name))) {
+std::string short_type_name(const std::string &full) {
+    size_t cut = full.find_last_of(".+/");
+    std::string s = cut == std::string::npos ? full : full.substr(cut + 1);
+    const size_t comma = s.find(',');
+    if (comma != std::string::npos) s = s.substr(0, comma);
+    return s;
+}
+
+int type_rank(const std::string &typeName, const std::string &query) {
+    if (typeName.empty() || query.empty()) return 0;
+    if (eq_ci(typeName.c_str(), query)) return 3;
+    if (eq_ci(short_type_name(typeName).c_str(), query)) return 2;
+    if (contains_ci(typeName, query)) return 1;
+    return 0;
+}
+
+std::string type_full_name(RemoteSession &s, uintptr_t klass) {
+    char buf[192] = {};
+    if (g.sym_class_get_type && g.sym_type_get_name) {
+        uintptr_t type = 0;
+        if (remote_session_call(s, g.sym_class_get_type, {klass}, type) && type) {
+            uintptr_t namePtr = 0;
+            if (remote_session_call(s, g.sym_type_get_name, {type}, namePtr) && mem_ptr_ok(namePtr)) {
+                read_remote_cstr(g.pid, namePtr, buf, sizeof(buf));
+                if (g.sym_free) {
+                    uintptr_t ignored = 0;
+                    remote_session_call(s, g.sym_free, {namePtr}, ignored);
+                }
+            }
+        }
+    }
+    if (!buf[0]) {
+        char name[96] = {};
+        char ns[96] = {};
+        if (g.sym_class_get_name)
+            call_cstr(s, g.sym_class_get_name, klass, name, sizeof(name));
+        if (!name[0]) klass_name_at(g.pid, klass, name, sizeof(name));
         if (g.sym_class_get_namespace)
             call_cstr(s, g.sym_class_get_namespace, klass, ns, sizeof(ns));
-        return name_hit(name, ns, wantNs, wantCls, wantFull);
+        if (name[0]) {
+            if (ns[0])
+                std::snprintf(buf, sizeof(buf), "%s.%s", ns, name);
+            else
+                std::snprintf(buf, sizeof(buf), "%s", name);
+        }
     }
-    if (!read_ns_name(g.pid, klass, ns, sizeof(ns), name, sizeof(name)) &&
-        !klass_name_at(g.pid, klass, name, sizeof(name)))
-        return false;
-    return name_hit(name, ns, wantNs, wantCls, wantFull);
+    return buf;
 }
 
+struct Hit {
+    uintptr_t klass = 0;
+    std::string typeName;
+    std::string image;
+    int rank = 0;
+};
+
 struct Found {
-    std::vector<uintptr_t> klasses;
+    std::vector<Hit> hits;
     size_t scanned = 0;
     size_t images = 0;
 };
 
-void keep_klass(Found &found, uintptr_t klass) {
-    if (!mem_ptr_ok(klass) || found.klasses.size() >= 8) return;
-    for (uintptr_t k : found.klasses)
-        if (k == klass) return;
-    found.klasses.push_back(klass);
+void keep_hit(Found &found, Hit hit) {
+    if (!mem_ptr_ok(hit.klass) || hit.rank <= 0) return;
+    for (Hit &old : found.hits) {
+        if (old.klass == hit.klass) {
+            if (hit.rank > old.rank) old = std::move(hit);
+            return;
+        }
+    }
+    size_t same = 0;
+    for (const Hit &old : found.hits)
+        if (old.rank == hit.rank) ++same;
+    if (hit.rank >= 2 && same >= 16) return;
+    if (hit.rank == 1 && same >= 24) return;
+    found.hits.push_back(std::move(hit));
 }
 
-void scan_images(RemoteSession &s, const std::string &wantNs, const std::string &wantCls,
-                 const std::string &wantFull, Found &found) {
+std::string image_name(RemoteSession &s, uintptr_t image) {
+    char buf[128] = {};
+    if (g.sym_image_get_name) call_cstr(s, g.sym_image_get_name, image, buf, sizeof(buf));
+    return buf;
+}
+
+void scan_all(RemoteSession &s, const std::string &query, Found &found) {
     if (!g.il2.sym_image_get_class || !g.il2.sym_image_get_class_count) return;
     for (uintptr_t image : g.images.all) {
-        if (found.klasses.size() >= 8) break;
         uintptr_t count = 0;
         if (!remote_session_call(s, g.il2.sym_image_get_class_count, {image}, count)) continue;
         const size_t n = (size_t)count;
         if (n == 0 || n > 250000) continue;
         ++found.images;
+        const std::string iname = image_name(s, image);
         for (size_t i = 0; i < n; ++i) {
             uintptr_t klass = 0;
             if (!remote_session_call(s, g.il2.sym_image_get_class, {image, i}, klass) || !klass)
                 continue;
             ++found.scanned;
-            if (class_matches(s, klass, wantNs, wantCls, wantFull)) keep_klass(found, klass);
-            if (found.klasses.size() >= 8) break;
+            const std::string typeName = type_full_name(s, klass);
+            const int rank = type_rank(typeName, query);
+            if (!rank) continue;
+            keep_hit(found, Hit{klass, typeName, iname, rank});
         }
     }
 }
 
 Found find_classes(RemoteSession &s, const char *fullName) {
     Found found;
+    const std::string query = fullName ? fullName : "";
+    if (query.empty()) return found;
     std::string ns, cls;
-    const std::string full = fullName ? fullName : "";
-    split_name(full, ns, cls);
-    if (cls.empty()) return found;
-    const char *guessNs[] = {"UnityEngine",
-                             "UnityEngine.UI",
-                             "UnityEngine.Events",
-                             "UnityEngine.Rendering",
-                             "System",
-                             "System.Collections.Generic",
-                             "Cinemachine",
-                             "TMPro",
-                             ""};
-    auto try_image = [&](uintptr_t image) {
-        if (!image || found.klasses.size() >= 8) return;
-        if (!ns.empty()) {
-            keep_klass(found, class_from_name(s, image, ns, cls));
-            keep_klass(found, class_from_name(s, image, "", cls));
-            return;
-        }
-        for (const char *gns : guessNs) {
-            if (found.klasses.size() >= 8) break;
-            keep_klass(found, class_from_name(s, image, gns, cls));
-        }
-    };
-    try_image(g.images.unityCore);
-    try_image(g.images.assemblyCSharp);
-    for (uintptr_t image : g.images.all) try_image(image);
-    if (found.klasses.empty()) scan_images(s, ns, cls, full, found);
+    split_name(query, ns, cls);
+    if (!ns.empty()) {
+        for (uintptr_t image : g.images.all)
+            keep_hit(found, Hit{class_from_name(s, image, ns, cls), query, "", 3});
+    }
+    scan_all(s, query, found);
+    std::sort(found.hits.begin(), found.hits.end(), [](const Hit &a, const Hit &b) {
+        if (a.rank != b.rank) return a.rank > b.rank;
+        return a.typeName < b.typeName;
+    });
     return found;
 }
 
@@ -255,6 +300,10 @@ void resolve_extra_syms() {
     g.sym_field_get_name = one("il2cpp_field_get_name");
     g.sym_class_get_name = one("il2cpp_class_get_name");
     g.sym_class_get_namespace = one("il2cpp_class_get_namespace");
+    g.sym_class_get_type = one("il2cpp_class_get_type");
+    g.sym_type_get_name = one("il2cpp_type_get_name");
+    g.sym_free = one("il2cpp_free");
+    g.sym_image_get_name = one("il2cpp_image_get_name");
 }
 
 bool call_cstr(RemoteSession &s, uintptr_t fn, uintptr_t arg, char *buf, size_t n) {
@@ -535,19 +584,33 @@ int ax_search(const char *query, char *out, size_t cap) {
         text = search_by_address(s, raw);
     } else {
         const Found found = find_classes(s, q.c_str());
-        if (found.klasses.empty()) {
-            char line[160];
+        if (found.hits.empty()) {
+            char line[192];
             std::snprintf(line, sizeof(line),
                           "not found: %s\nfull scan %zu classes in %zu images",
                           q.c_str(), found.scanned, found.images);
             text = line;
         } else {
-            for (size_t i = 0; i < found.klasses.size(); ++i) {
-                if (i) text += "\n";
-                text += describe(s, found.klasses[i]);
+            char head[160];
+            std::snprintf(head, sizeof(head), "matches %zu\nfull scan %zu classes in %zu images\n",
+                          found.hits.size(), found.scanned, found.images);
+            text = head;
+            int detailed = 0;
+            for (const Hit &hit : found.hits) {
+                if (hit.rank >= 2 && detailed < 4) {
+                    if (!hit.image.empty()) text += "[" + hit.image + "]\n";
+                    text += describe(s, hit.klass);
+                    text += "\n";
+                    ++detailed;
+                } else {
+                    char line[256];
+                    std::snprintf(line, sizeof(line), "%s%s%s  0x%llx\n",
+                                  hit.typeName.c_str(), hit.image.empty() ? "" : "  [",
+                                  hit.image.empty() ? "" : (hit.image + "]").c_str(),
+                                  (unsigned long long)hit.klass);
+                    text += line;
+                }
             }
-            if (found.scanned)
-                text += "\nfull scan " + std::to_string(found.scanned) + " classes";
         }
     }
     remote_session_end(s);
