@@ -23,7 +23,7 @@ void remote_session_end(RemoteSession &s);
 uintptr_t remote_session_scratch(RemoteSession &s, int slot, size_t bytes);
 
 bool remote_session_call(RemoteSession &s, uintptr_t func, const std::vector<uintptr_t> &args,
-                         uintptr_t &ret_x0);
+                         uintptr_t &ret_x0, int timeout_ms = 200);
 
 /* Single-shot (attach → one call → detach). */
 bool remote_call(pid_t pid, uintptr_t func, const std::vector<uintptr_t> &args, uintptr_t &ret_x0,

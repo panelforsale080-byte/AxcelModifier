@@ -104,7 +104,7 @@ uintptr_t remote_session_scratch(RemoteSession &s, int slot, size_t bytes) {
 }
 
 bool remote_session_call(RemoteSession &s, uintptr_t func, const std::vector<uintptr_t> &args,
-                         uintptr_t &ret_x0) {
+                         uintptr_t &ret_x0, int timeout_ms) {
     ret_x0 = 0;
     if (!s.attached || !func) {
         std::snprintf(s.err, sizeof(s.err), "session/call invalid");
@@ -122,7 +122,8 @@ bool remote_session_call(RemoteSession &s, uintptr_t func, const std::vector<uin
     ptrace(PTRACE_CONT, s.tid, nullptr, nullptr);
     int st = 0;
     bool success = false;
-    for (int i = 0; i < 40; ++i) {
+    const int spins = timeout_ms < 5 ? 1 : timeout_ms / 5;
+    for (int i = 0; i < spins; ++i) {
         const pid_t w = waitpid(s.tid, &st, WNOHANG);
         if (w == s.tid) {
             success = true;

@@ -127,7 +127,7 @@ uintptr_t class_from_name(RemoteSession &s, uintptr_t image, const std::string &
     const uintptr_t namePtr = scratch_cstr(s, g.pid, 6, cls.c_str());
     if (!nsPtr || !namePtr) return 0;
     uintptr_t klass = 0;
-    if (!remote_session_call(s, g.il2.sym_class_from_name, {image, nsPtr, namePtr}, klass))
+    if (!remote_session_call(s, g.il2.sym_class_from_name, {image, nsPtr, namePtr}, klass, 2500))
         return 0;
     return mem_ptr_ok(klass) ? klass : 0;
 }
@@ -364,8 +364,48 @@ Found find_classes(RemoteSession &s, const char *fullName) {
     found.images = g.indexImages;
     for (const ClassRec &rec : g.index) {
         const int rank = type_rank(rec.full, query);
-        if (!rank) continue;
+        if (rank < 2) continue;
         keep_hit(found, Hit{rec.klass, rec.full, rec.image, rank});
+    }
+    if (found.hits.empty()) {
+        struct Img {
+            uintptr_t image;
+            std::string name;
+            std::string fileNs;
+        };
+        std::vector<Img> imgs;
+        for (uintptr_t image : g.images.all) {
+            Img im{image, image_name(s, image), {}};
+            im.fileNs = im.name;
+            const auto dot = im.fileNs.rfind('.');
+            if (dot != std::string::npos &&
+                (im.fileNs.compare(dot, 4, ".dll") == 0 || im.fileNs.compare(dot, 4, ".DLL") == 0))
+                im.fileNs.resize(dot);
+            const bool early = im.fileNs.find("Mono.Security") != std::string::npos ||
+                               im.fileNs.find("mscorlib") != std::string::npos;
+            if (early) imgs.insert(imgs.begin(), std::move(im));
+            else imgs.push_back(std::move(im));
+        }
+        for (const Img &im : imgs) {
+            const std::string namespaces[] = {ns, {}, im.fileNs};
+            for (const std::string &tryNs : namespaces) {
+                if (&tryNs != &namespaces[0] && tryNs == namespaces[0]) continue;
+                const uintptr_t klass = class_from_name(s, im.image, tryNs, cls);
+                if (!mem_ptr_ok(klass)) continue;
+                std::string full = tryNs.empty() ? cls : tryNs + "." + cls;
+                keep_hit(found, Hit{klass, full, im.name, 3});
+                g.index.push_back(ClassRec{klass, full, im.name});
+                break;
+            }
+            if (!found.hits.empty()) break;
+        }
+    }
+    if (found.hits.empty()) {
+        for (const ClassRec &rec : g.index) {
+            const int rank = type_rank(rec.full, query);
+            if (!rank) continue;
+            keep_hit(found, Hit{rec.klass, rec.full, rec.image, rank});
+        }
     }
     std::sort(found.hits.begin(), found.hits.end(), [](const Hit &a, const Hit &b) {
         if (a.rank != b.rank) return a.rank > b.rank;
