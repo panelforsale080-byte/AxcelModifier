@@ -16,6 +16,12 @@
 
 namespace {
 
+struct ClassRec {
+    uintptr_t klass = 0;
+    std::string full;
+    std::string image;
+};
+
 struct Images {
     uintptr_t assemblyCSharp = 0;
     uintptr_t unityCore = 0;
@@ -40,6 +46,9 @@ struct State {
     uintptr_t sym_class_get_methods = 0;
     uintptr_t sym_method_get_name = 0;
     bool ready = false;
+    bool indexReady = false;
+    size_t indexImages = 0;
+    std::vector<ClassRec> index;
 };
 
 State g;
@@ -252,26 +261,65 @@ std::string image_name(RemoteSession &s, uintptr_t image) {
     return buf;
 }
 
-void scan_all(RemoteSession &s, const std::string &query, Found &found) {
-    if (!g.il2.sym_image_get_class || !g.il2.sym_image_get_class_count) return;
+void learn_name_offs(RemoteSession &s, uintptr_t klass, uintptr_t &nameOff, uintptr_t &nsOff) {
+    if (!klass || !g.sym_class_get_name) return;
+    uintptr_t namePtr = 0;
+    if (!remote_session_call(s, g.sym_class_get_name, {klass}, namePtr) || !mem_ptr_ok(namePtr))
+        return;
+    uintptr_t nsPtr = 0;
+    if (g.sym_class_get_namespace)
+        remote_session_call(s, g.sym_class_get_namespace, {klass}, nsPtr);
+    for (uintptr_t off = 0; off <= 0x60; off += 8) {
+        uintptr_t p = 0;
+        if (!mem_read(g.pid, klass + off, p)) continue;
+        if (p == namePtr) nameOff = off;
+        if (nsPtr && p == nsPtr) nsOff = off;
+    }
+}
+
+bool read_indexed_name(uintptr_t klass, uintptr_t nameOff, uintptr_t nsOff, std::string &full) {
+    char name[128] = {};
+    char ns[128] = {};
+    uintptr_t np = 0;
+    if (!mem_read(g.pid, klass + nameOff, np) || !read_remote_cstr(g.pid, np, name, sizeof(name))) {
+        if (!read_ns_name(g.pid, klass, ns, sizeof(ns), name, sizeof(name))) return false;
+    } else if (nsOff) {
+        uintptr_t sp = 0;
+        if (mem_read(g.pid, klass + nsOff, sp)) read_remote_cstr(g.pid, sp, ns, sizeof(ns));
+    }
+    if (!name[0]) return false;
+    full = ns[0] ? std::string(ns) + "." + name : std::string(name);
+    return true;
+}
+
+void ensure_index(RemoteSession &s) {
+    if (g.indexReady || !g.il2.sym_image_get_class || !g.il2.sym_image_get_class_count) return;
+    g.index.clear();
+    g.indexImages = 0;
+    uintptr_t nameOff = 0x10;
+    uintptr_t nsOff = 0x18;
+    bool learned = false;
     for (uintptr_t image : g.images.all) {
         uintptr_t count = 0;
         if (!remote_session_call(s, g.il2.sym_image_get_class_count, {image}, count)) continue;
         const size_t n = (size_t)count;
         if (n == 0 || n > 250000) continue;
-        ++found.images;
+        ++g.indexImages;
         const std::string iname = image_name(s, image);
         for (size_t i = 0; i < n; ++i) {
             uintptr_t klass = 0;
             if (!remote_session_call(s, g.il2.sym_image_get_class, {image, i}, klass) || !klass)
                 continue;
-            ++found.scanned;
-            const std::string typeName = type_full_name(s, klass);
-            const int rank = type_rank(typeName, query);
-            if (!rank) continue;
-            keep_hit(found, Hit{klass, typeName, iname, rank});
+            if (!learned) {
+                learn_name_offs(s, klass, nameOff, nsOff);
+                learned = true;
+            }
+            std::string full;
+            if (!read_indexed_name(klass, nameOff, nsOff, full)) continue;
+            g.index.push_back(ClassRec{klass, std::move(full), iname});
         }
     }
+    g.indexReady = true;
 }
 
 Found find_classes(RemoteSession &s, const char *fullName) {
@@ -280,11 +328,47 @@ Found find_classes(RemoteSession &s, const char *fullName) {
     if (query.empty()) return found;
     std::string ns, cls;
     split_name(query, ns, cls);
-    if (!ns.empty()) {
-        for (uintptr_t image : g.images.all)
-            keep_hit(found, Hit{class_from_name(s, image, ns, cls), query, "", 3});
+    if (cls.empty()) return found;
+
+    auto consider = [&](uintptr_t image, const char *tryNs) {
+        if (found.hits.size() >= 4) return;
+        const uintptr_t klass = class_from_name(s, image, tryNs ? tryNs : "", cls);
+        if (!mem_ptr_ok(klass)) return;
+        std::string full = (tryNs && tryNs[0]) ? std::string(tryNs) + "." + cls : cls;
+        keep_hit(found, Hit{klass, std::move(full), image_name(s, image), 3});
+    };
+
+    const char *guessNs[] = {"", "UnityEngine", "UnityEngine.UI", "System"};
+    std::vector<uintptr_t> order;
+    if (g.images.unityCore) order.push_back(g.images.unityCore);
+    if (g.images.assemblyCSharp) order.push_back(g.images.assemblyCSharp);
+    for (uintptr_t image : g.images.all) {
+        bool seen = false;
+        for (uintptr_t x : order)
+            if (x == image) seen = true;
+        if (!seen) order.push_back(image);
     }
-    scan_all(s, query, found);
+    for (uintptr_t image : order) {
+        if (!ns.empty())
+            consider(image, ns.c_str());
+        else {
+            for (const char *gns : guessNs) {
+                consider(image, gns);
+                if (!found.hits.empty()) break;
+            }
+        }
+        if (!found.hits.empty()) break;
+    }
+    if (found.hits.empty()) {
+        ensure_index(s);
+        found.scanned = g.index.size();
+        found.images = g.indexImages;
+        for (const ClassRec &rec : g.index) {
+            const int rank = type_rank(rec.full, query);
+            if (!rank) continue;
+            keep_hit(found, Hit{rec.klass, rec.full, rec.image, rank});
+        }
+    }
     std::sort(found.hits.begin(), found.hits.end(), [](const Hit &a, const Hit &b) {
         if (a.rank != b.rank) return a.rank > b.rank;
         return a.typeName < b.typeName;
