@@ -98,49 +98,102 @@ uintptr_t class_from_name(RemoteSession &s, uintptr_t image, const std::string &
     return mem_ptr_ok(klass) ? klass : 0;
 }
 
-bool name_matches(pid_t pid, uintptr_t klass, const std::string &want) {
-    char buf[96] = {};
-    if (!klass_name_at(pid, klass, buf, sizeof(buf))) return false;
-    if (want == buf) return true;
-    const char *dot = std::strrchr(buf, '.');
-    return dot && want == (dot + 1);
+bool eq_ci(const char *a, const std::string &b) {
+    if (!a) return false;
+    const size_t n = std::strlen(a);
+    if (n != b.size()) return false;
+    for (size_t i = 0; i < n; ++i)
+        if (std::tolower((unsigned char)a[i]) != std::tolower((unsigned char)b[i])) return false;
+    return true;
 }
 
-uintptr_t scan_images(RemoteSession &s, const std::string &wantCls) {
-    if (!g.il2.sym_image_get_class || !g.il2.sym_image_get_class_count) return 0;
+bool read_ns_name(pid_t pid, uintptr_t klass, char *ns, size_t nsn, char *name, size_t namen) {
+    struct Pair {
+        uintptr_t nameOff;
+        uintptr_t nsOff;
+    };
+    static const Pair kPairs[] = {{0x10, 0x18}, {0x18, 0x10}, {0x08, 0x10}};
+    for (const Pair &p : kPairs) {
+        name[0] = '\0';
+        ns[0] = '\0';
+        uintptr_t np = 0;
+        if (!mem_read(pid, klass + p.nameOff, np)) continue;
+        if (!read_remote_cstr(pid, np, name, namen)) continue;
+        uintptr_t sp = 0;
+        if (mem_read(pid, klass + p.nsOff, sp)) read_remote_cstr(pid, sp, ns, nsn);
+        return true;
+    }
+    return false;
+}
+
+bool class_matches(uintptr_t klass, const std::string &wantNs, const std::string &wantCls,
+                   const std::string &wantFull) {
+    char name[128] = {};
+    char ns[128] = {};
+    if (!read_ns_name(g.pid, klass, ns, sizeof(ns), name, sizeof(name))) {
+        if (!klass_name_at(g.pid, klass, name, sizeof(name))) return false;
+    }
+    if (eq_ci(name, wantFull) || eq_ci(name, wantCls)) {
+        if (!wantNs.empty() && ns[0] && !eq_ci(ns, wantNs)) return false;
+        return true;
+    }
+    std::string full = ns[0] ? std::string(ns) + "." + name : std::string(name);
+    if (eq_ci(full.c_str(), wantFull) || eq_ci(full.c_str(), wantCls)) return true;
+    for (char &c : full)
+        if (c == '/' || c == '+') c = '.';
+    return eq_ci(full.c_str(), wantFull);
+}
+
+struct Found {
+    std::vector<uintptr_t> klasses;
+    size_t scanned = 0;
+    size_t images = 0;
+};
+
+void keep_klass(Found &found, uintptr_t klass) {
+    if (!mem_ptr_ok(klass) || found.klasses.size() >= 8) return;
+    for (uintptr_t k : found.klasses)
+        if (k == klass) return;
+    found.klasses.push_back(klass);
+}
+
+void scan_images(RemoteSession &s, const std::string &wantNs, const std::string &wantCls,
+                 const std::string &wantFull, Found &found) {
+    if (!g.il2.sym_image_get_class || !g.il2.sym_image_get_class_count) return;
     for (uintptr_t image : g.images.all) {
+        if (found.klasses.size() >= 8) break;
         uintptr_t count = 0;
         if (!remote_session_call(s, g.il2.sym_image_get_class_count, {image}, count)) continue;
         const size_t n = (size_t)count;
-        if (n == 0 || n > 12000) continue;
-        const size_t limit = std::min(n, (size_t)6000);
-        for (size_t i = 0; i < limit; ++i) {
+        if (n == 0 || n > 250000) continue;
+        ++found.images;
+        for (size_t i = 0; i < n; ++i) {
             uintptr_t klass = 0;
             if (!remote_session_call(s, g.il2.sym_image_get_class, {image, i}, klass) || !klass)
                 continue;
-            if (name_matches(g.pid, klass, wantCls)) return klass;
+            ++found.scanned;
+            if (class_matches(klass, wantNs, wantCls, wantFull)) keep_klass(found, klass);
+            if (found.klasses.size() >= 8) break;
         }
     }
-    return 0;
 }
 
-uintptr_t find_class(RemoteSession &s, const char *fullName) {
+Found find_classes(RemoteSession &s, const char *fullName) {
+    Found found;
     std::string ns, cls;
-    split_name(fullName ? fullName : "", ns, cls);
-    if (cls.empty()) return 0;
-    uintptr_t klass = 0;
-    if (g.images.assemblyCSharp)
-        klass = class_from_name(s, g.images.assemblyCSharp, ns, cls);
-    if (!klass && g.images.unityCore)
-        klass = class_from_name(s, g.images.unityCore, ns, cls);
-    if (!klass) {
-        for (uintptr_t image : g.images.all) {
-            klass = class_from_name(s, image, ns, cls);
-            if (klass) break;
-        }
-    }
-    if (!klass) klass = scan_images(s, cls);
-    return klass;
+    const std::string full = fullName ? fullName : "";
+    split_name(full, ns, cls);
+    if (cls.empty()) return found;
+    auto try_image = [&](uintptr_t image) {
+        if (!image) return;
+        keep_klass(found, class_from_name(s, image, ns, cls));
+        if (!ns.empty()) keep_klass(found, class_from_name(s, image, "", cls));
+    };
+    try_image(g.images.assemblyCSharp);
+    try_image(g.images.unityCore);
+    for (uintptr_t image : g.images.all) try_image(image);
+    if (found.klasses.empty()) scan_images(s, ns, cls, full, found);
+    return found;
 }
 
 void resolve_extra_syms() {
@@ -175,7 +228,7 @@ void append_fields(RemoteSession &s, uintptr_t klass, std::string &out) {
     mem_write(g.pid, iterSlot, &zero, sizeof(zero));
     out += "fields:\n";
     int shown = 0;
-    for (int i = 0; i < 400 && shown < 80; ++i) {
+    for (int i = 0; i < 800 && shown < 400; ++i) {
         uintptr_t field = 0;
         if (!remote_session_call(s, g.sym_class_get_fields, {klass, iterSlot}, field) ||
             !mem_ptr_ok(field))
@@ -302,7 +355,7 @@ void collect_images(RemoteSession &s) {
         !mem_read(g.pid, sizeSlot, count) || !mem_ptr_ok(assemblies))
         return;
     if (count > 512) count = 512;
-    for (size_t i = 0; i < count && g.images.all.size() < 80; ++i) {
+    for (size_t i = 0; i < count && g.images.all.size() < 512; ++i) {
         uintptr_t asmPtr = 0, image = 0;
         if (!mem_read(g.pid, assemblies + i * sizeof(uintptr_t), asmPtr) || !asmPtr) continue;
         if (!remote_session_call(s, g.il2.sym_assembly_get_image, {asmPtr}, image) || !image)
@@ -312,6 +365,14 @@ void collect_images(RemoteSession &s) {
             if (x == image) dup = true;
         if (!dup) g.images.all.push_back(image);
     }
+    auto push_unique = [](uintptr_t image) {
+        if (!image) return;
+        for (uintptr_t x : g.images.all)
+            if (x == image) return;
+        g.images.all.push_back(image);
+    };
+    push_unique(g.images.assemblyCSharp);
+    push_unique(g.images.unityCore);
 }
 
 std::string trim(std::string s) {
@@ -426,11 +487,21 @@ int ax_search(const char *query, char *out, size_t cap) {
         const uintptr_t raw = (uintptr_t)std::strtoull(q.c_str(), nullptr, 0);
         text = search_by_address(s, raw);
     } else {
-        const uintptr_t klass = find_class(s, q.c_str());
-        if (!klass)
-            text = "not found: " + q + "\nfast class_from_name, then a short image scan";
-        else
-            text = describe(s, klass);
+        const Found found = find_classes(s, q.c_str());
+        if (found.klasses.empty()) {
+            char line[160];
+            std::snprintf(line, sizeof(line),
+                          "not found: %s\nfull scan %zu classes in %zu images",
+                          q.c_str(), found.scanned, found.images);
+            text = line;
+        } else {
+            for (size_t i = 0; i < found.klasses.size(); ++i) {
+                if (i) text += "\n";
+                text += describe(s, found.klasses[i]);
+            }
+            if (found.scanned)
+                text += "\nfull scan " + std::to_string(found.scanned) + " classes";
+        }
     }
     remote_session_end(s);
     return put_text(out, cap, text);
