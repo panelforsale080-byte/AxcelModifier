@@ -35,6 +35,10 @@ struct State {
     uintptr_t sym_type_get_name = 0;
     uintptr_t sym_free = 0;
     uintptr_t sym_image_get_name = 0;
+    uintptr_t sym_class_get_parent = 0;
+    uintptr_t sym_class_get_flags = 0;
+    uintptr_t sym_class_get_methods = 0;
+    uintptr_t sym_method_get_name = 0;
     bool ready = false;
 };
 
@@ -304,6 +308,10 @@ void resolve_extra_syms() {
     g.sym_type_get_name = one("il2cpp_type_get_name");
     g.sym_free = one("il2cpp_free");
     g.sym_image_get_name = one("il2cpp_image_get_name");
+    g.sym_class_get_parent = one("il2cpp_class_get_parent");
+    g.sym_class_get_flags = one("il2cpp_class_get_flags");
+    g.sym_class_get_methods = one("il2cpp_class_get_methods");
+    g.sym_method_get_name = one("il2cpp_method_get_name");
 }
 
 bool call_cstr(RemoteSession &s, uintptr_t fn, uintptr_t arg, char *buf, size_t n) {
@@ -315,14 +323,13 @@ bool call_cstr(RemoteSession &s, uintptr_t fn, uintptr_t arg, char *buf, size_t 
 
 void append_fields(RemoteSession &s, uintptr_t klass, std::string &out) {
     if (!g.sym_class_get_fields || !g.il2.sym_field_get_offset) {
-        out += "fields: il2cpp_class_get_fields not exported\n";
+        out += "\t// il2cpp_class_get_fields not exported\n";
         return;
     }
     const uintptr_t iterSlot = remote_session_scratch(s, 8, sizeof(uintptr_t));
     if (!iterSlot) return;
     uintptr_t zero = 0;
     mem_write(g.pid, iterSlot, &zero, sizeof(zero));
-    out += "fields:\n";
     int shown = 0;
     for (int i = 0; i < 800 && shown < 400; ++i) {
         uintptr_t field = 0;
@@ -334,28 +341,123 @@ void append_fields(RemoteSession &s, uintptr_t klass, std::string &out) {
         uintptr_t off = 0;
         remote_session_call(s, g.il2.sym_field_get_offset, {field}, off);
         char line[120];
-        std::snprintf(line, sizeof(line), "  %-28s 0x%llx\n", name[0] ? name : "?",
+        std::snprintf(line, sizeof(line), "\t%s; // Offset: 0x%llx\n", name[0] ? name : "?",
                       (unsigned long long)off);
         out += line;
         ++shown;
     }
-    if (shown == 0) out += "  (none)\n";
+    if (shown == 0) out += "\t// (none)\n";
 }
 
-std::string describe(RemoteSession &s, uintptr_t klass) {
-    char name[96] = {};
-    char ns[96] = {};
-    if (!call_cstr(s, g.sym_class_get_name, klass, name, sizeof(name)))
-        klass_name_at(g.pid, klass, name, sizeof(name));
-    call_cstr(s, g.sym_class_get_namespace, klass, ns, sizeof(ns));
-    if (!name[0]) return "address is not an Il2CppClass\n";
-    char head[256];
-    std::snprintf(head, sizeof(head),
-                  "class %s%s%s\nklass 0x%llx\nlib %s base 0x%llx\n",
-                  ns[0] ? ns : "", ns[0] ? "." : "", name, (unsigned long long)klass,
-                  g.il2.libBaseName, (unsigned long long)g.il2.base);
-    std::string out = head;
+void append_methods(RemoteSession &s, uintptr_t klass, std::string &out) {
+    out += "\n\t// Methods\n";
+    if (!g.sym_class_get_methods) {
+        out += "\t// il2cpp_class_get_methods not exported\n";
+        return;
+    }
+    const uintptr_t iterSlot = remote_session_scratch(s, 9, sizeof(uintptr_t));
+    if (!iterSlot) return;
+    uintptr_t zero = 0;
+    mem_write(g.pid, iterSlot, &zero, sizeof(zero));
+    int shown = 0;
+    for (int i = 0; i < 400 && shown < 120; ++i) {
+        uintptr_t method = 0;
+        if (!remote_session_call(s, g.sym_class_get_methods, {klass, iterSlot}, method) ||
+            !mem_ptr_ok(method))
+            break;
+        char name[96] = {};
+        if (g.sym_method_get_name) call_cstr(s, g.sym_method_get_name, method, name, sizeof(name));
+        uintptr_t fn = 0;
+        if (!mem_read(g.pid, method, fn) || !mem_ptr_ok(fn))
+            mem_read(g.pid, method + 8, fn);
+        const bool inLib = g.il2.base && g.il2.end > g.il2.base && fn >= g.il2.base && fn < g.il2.end;
+        const uintptr_t rva = inLib ? fn - g.il2.base : 0;
+        char line[320];
+        if (inLib) {
+            std::snprintf(line, sizeof(line),
+                          "\t// Offset: 0x%llx\n\t// Address: 0x%llx\n\t// base+0x%llx\n\t%s() { }\n",
+                          (unsigned long long)rva, (unsigned long long)fn, (unsigned long long)rva,
+                          name[0] ? name : "?");
+        } else if (mem_ptr_ok(fn)) {
+            std::snprintf(line, sizeof(line),
+                          "\t// Address: 0x%llx\n\t// base 0x%llx\n\t%s() { }\n",
+                          (unsigned long long)fn, (unsigned long long)g.il2.base,
+                          name[0] ? name : "?");
+        } else {
+            std::snprintf(line, sizeof(line), "\t// no pointer\n\t%s() { }\n", name[0] ? name : "?");
+        }
+        out += line;
+        ++shown;
+    }
+    if (shown == 0) out += "\t// (none)\n";
+}
+
+std::string describe(RemoteSession &s, uintptr_t klass, const std::string &knownType) {
+    std::string typeName = knownType.empty() ? type_full_name(s, klass) : knownType;
+    char ns[128] = {};
+    char name[128] = {};
+    if (g.sym_class_get_namespace)
+        call_cstr(s, g.sym_class_get_namespace, klass, ns, sizeof(ns));
+    if (g.sym_class_get_name)
+        call_cstr(s, g.sym_class_get_name, klass, name, sizeof(name));
+    if (!name[0]) {
+        const std::string shortName = short_type_name(typeName);
+        std::snprintf(name, sizeof(name), "%s", shortName.c_str());
+    }
+    if (!ns[0]) {
+        const auto dot = typeName.find_last_of('.');
+        if (dot != std::string::npos)
+            std::snprintf(ns, sizeof(ns), "%s", typeName.substr(0, dot).c_str());
+    }
+    if (!name[0] && typeName.empty()) return "address is not an Il2CppClass\n";
+
+    uintptr_t flags = 0;
+    if (g.sym_class_get_flags) remote_session_call(s, g.sym_class_get_flags, {klass}, flags);
+    flags &= 0xffffffffu;
+    const bool isStatic = (flags & 0x80u) && (flags & 0x100u);
+    const bool isSealed = (flags & 0x100u) && !isStatic;
+    const bool isAbstract = (flags & 0x80u) && !isStatic;
+    const bool isIface = (flags & 0x20u) != 0;
+    const unsigned vis = (unsigned)(flags & 7u);
+
+    uintptr_t parent = 0;
+    std::string parentName;
+    if (g.sym_class_get_parent &&
+        remote_session_call(s, g.sym_class_get_parent, {klass}, parent) && mem_ptr_ok(parent)) {
+        parentName = short_type_name(type_full_name(s, parent));
+        if (parentName == "Object" || parentName == "ValueType" || parentName == "Enum")
+            parentName.clear();
+    }
+
+    std::string out;
+    char line[384];
+    std::snprintf(line, sizeof(line), "// Namespace: %s\n", ns[0] ? ns : "");
+    out += line;
+    if (isSealed) out += "// [Sealed]\n";
+    std::string decl;
+    if (vis == 1 || vis == 2) decl += "public ";
+    else if (vis == 0 || vis == 5 || vis == 6) decl += "internal ";
+    else if (vis == 3) decl += "private ";
+    else if (vis == 4) decl += "protected ";
+    if (isStatic) decl += "static ";
+    else if (isAbstract && !isIface) decl += "abstract ";
+    else if (isSealed) decl += "sealed ";
+    decl += isIface ? "interface " : "class ";
+    decl += name[0] ? name : "?";
+    if (!parentName.empty()) {
+        decl += " : ";
+        decl += parentName;
+    }
+    out += decl;
+    out += "\n";
+    std::snprintf(line, sizeof(line),
+                  "// klass 0x%llx\n// parent %s 0x%llx\n// lib %s base 0x%llx\n{\n\t// Fields\n",
+                  (unsigned long long)klass, parentName.empty() ? "-" : parentName.c_str(),
+                  (unsigned long long)parent, g.il2.libBaseName, (unsigned long long)g.il2.base);
+    out += line;
     append_fields(s, klass, out);
+    append_methods(s, klass, out);
+    out += "}\n";
     return out;
 }
 
@@ -379,11 +481,11 @@ std::string search_by_address(RemoteSession &s, uintptr_t raw) {
         std::snprintf(math, sizeof(math), "address 0x%llx\nlib base 0x%llx\n",
                       (unsigned long long)addr, (unsigned long long)base);
     }
-    std::string body = describe(s, addr);
+    std::string body = describe(s, addr, "");
     if (body.find("not an Il2CppClass") != std::string::npos) {
         uintptr_t pointed = 0;
         if (mem_read(g.pid, addr, pointed) && mem_ptr_ok(pointed)) {
-            std::string nested = describe(s, pointed);
+            std::string nested = describe(s, pointed, "");
             if (nested.find("not an Il2CppClass") == std::string::npos) {
                 char hop[96];
                 std::snprintf(hop, sizeof(hop), "pointer -> klass 0x%llx\n",
@@ -599,7 +701,7 @@ int ax_search(const char *query, char *out, size_t cap) {
             for (const Hit &hit : found.hits) {
                 if (hit.rank >= 2 && detailed < 4) {
                     if (!hit.image.empty()) text += "[" + hit.image + "]\n";
-                    text += describe(s, hit.klass);
+                    text += describe(s, hit.klass, hit.typeName);
                     text += "\n";
                     ++detailed;
                 } else {

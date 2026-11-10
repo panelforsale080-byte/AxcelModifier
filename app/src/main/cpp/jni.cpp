@@ -23,7 +23,7 @@ Java_com_axcel_modifier_Native_attach(JNIEnv *env, jclass, jint pid) {
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_axcel_modifier_Native_search(JNIEnv *env, jclass, jstring query) {
     const char *q = query ? env->GetStringUTFChars(query, nullptr) : "";
-    std::string buf(48 * 1024, '\0');
+    std::string buf(256 * 1024, '\0');
     ax_search(q ? q : "", buf.data(), buf.size());
     if (query) env->ReleaseStringUTFChars(query, q);
     return env->NewStringUTF(buf.c_str());

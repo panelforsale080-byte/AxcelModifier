@@ -14,6 +14,9 @@ import android.widget.ListView;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
+import java.io.File;
+import java.io.FileWriter;
+import java.io.IOException;
 import java.util.ArrayList;
 
 public class MainActivity extends Activity {
@@ -104,8 +107,35 @@ public class MainActivity extends Activity {
         result.setText("Searching…");
         new Thread(() -> {
             String msg = Native.search(q);
-            runOnUiThread(() -> result.setText(msg == null ? "search failed" : msg));
+            String saved = msg == null ? "" : saveFinderLog(msg);
+            runOnUiThread(() -> {
+                if (msg == null) {
+                    result.setText("search failed");
+                    return;
+                }
+                result.setText(saved.isEmpty() ? msg : msg + "\n\nsaved\n" + saved);
+            });
         }).start();
+    }
+
+    private String saveFinderLog(String text) {
+        StringBuilder where = new StringBuilder();
+        File[] dirs = new File[] {
+                getExternalFilesDir(null),
+                new File("/sdcard/Download"),
+                new File("/sdcard")
+        };
+        for (File dir : dirs) {
+            if (dir == null) continue;
+            File f = new File(dir, "i2cpp finder.txt");
+            try (FileWriter w = new FileWriter(f, false)) {
+                w.write(text);
+                if (where.length() > 0) where.append('\n');
+                where.append(f.getAbsolutePath());
+            } catch (IOException ignored) {
+            }
+        }
+        return where.toString();
     }
 
     private TextView label(String text, int sp, boolean bold) {
