@@ -95,7 +95,7 @@ public class MainActivity extends Activity {
             status.setText("bad pid");
             return;
         }
-        status.setText("Reading IL2CPP domain…");
+        status.setText("Reading IL2CPP classes…");
         new Thread(() -> {
             String msg = Native.attach(pid);
             runOnUiThread(() -> status.setText(msg == null ? "attach failed" : msg));

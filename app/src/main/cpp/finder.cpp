@@ -261,33 +261,53 @@ std::string image_name(RemoteSession &s, uintptr_t image) {
     return buf;
 }
 
-void learn_name_offs(RemoteSession &s, uintptr_t klass, uintptr_t &nameOff, uintptr_t &nsOff) {
-    if (!klass || !g.sym_class_get_name) return;
-    uintptr_t namePtr = 0;
-    if (!remote_session_call(s, g.sym_class_get_name, {klass}, namePtr) || !mem_ptr_ok(namePtr))
-        return;
-    uintptr_t nsPtr = 0;
-    if (g.sym_class_get_namespace)
-        remote_session_call(s, g.sym_class_get_namespace, {klass}, nsPtr);
-    for (uintptr_t off = 0; off <= 0x60; off += 8) {
-        uintptr_t p = 0;
-        if (!mem_read(g.pid, klass + off, p)) continue;
-        if (p == namePtr) nameOff = off;
-        if (nsPtr && p == nsPtr) nsOff = off;
-    }
+bool pointer_is_cstr(uintptr_t p, const char *expect) {
+    char buf[128] = {};
+    if (!expect || !expect[0] || !read_remote_cstr(g.pid, p, buf, sizeof(buf))) return false;
+    return std::strcmp(buf, expect) == 0;
 }
 
-bool read_indexed_name(uintptr_t klass, uintptr_t nameOff, uintptr_t nsOff, std::string &full) {
+bool learn_name_offs(RemoteSession &s, uintptr_t klass, uintptr_t &nameOff, uintptr_t &nsOff) {
+    if (!klass || !g.sym_class_get_name) return false;
+    char expect[96] = {};
+    char nsExpect[96] = {};
+    if (!call_cstr(s, g.sym_class_get_name, klass, expect, sizeof(expect))) return false;
+    const bool haveNs =
+        g.sym_class_get_namespace &&
+        call_cstr(s, g.sym_class_get_namespace, klass, nsExpect, sizeof(nsExpect));
+    bool nameFound = false;
+    for (uintptr_t off = 0; off <= 0x80; off += 8) {
+        uintptr_t p = 0;
+        if (!mem_read(g.pid, klass + off, p)) continue;
+        if (!nameFound && pointer_is_cstr(p, expect)) {
+            nameOff = off;
+            nameFound = true;
+        }
+        if (haveNs && nsExpect[0] && pointer_is_cstr(p, nsExpect)) nsOff = off;
+    }
+    return nameFound;
+}
+
+bool read_indexed_name(RemoteSession &s, uintptr_t klass, uintptr_t nameOff, uintptr_t nsOff,
+                       bool apiNames, std::string &full) {
     char name[128] = {};
     char ns[128] = {};
-    uintptr_t np = 0;
-    if (!mem_read(g.pid, klass + nameOff, np) || !read_remote_cstr(g.pid, np, name, sizeof(name))) {
-        if (!read_ns_name(g.pid, klass, ns, sizeof(ns), name, sizeof(name))) return false;
-    } else if (nsOff) {
-        uintptr_t sp = 0;
-        if (mem_read(g.pid, klass + nsOff, sp)) read_remote_cstr(g.pid, sp, ns, sizeof(ns));
+    bool fromApi = apiNames;
+    if (!apiNames) {
+        uintptr_t np = 0;
+        if (mem_read(g.pid, klass + nameOff, np))
+            read_remote_cstr(g.pid, np, name, sizeof(name));
+        if (name[0] && nsOff) {
+            uintptr_t sp = 0;
+            if (mem_read(g.pid, klass + nsOff, sp)) read_remote_cstr(g.pid, sp, ns, sizeof(ns));
+        }
+    }
+    if (!name[0] && g.sym_class_get_name) {
+        fromApi = call_cstr(s, g.sym_class_get_name, klass, name, sizeof(name));
     }
     if (!name[0]) return false;
+    if (fromApi && !ns[0] && g.sym_class_get_namespace)
+        call_cstr(s, g.sym_class_get_namespace, klass, ns, sizeof(ns));
     full = ns[0] ? std::string(ns) + "." + name : std::string(name);
     return true;
 }
@@ -297,8 +317,22 @@ void ensure_index(RemoteSession &s) {
     g.index.clear();
     g.indexImages = 0;
     uintptr_t nameOff = 0x10;
-    uintptr_t nsOff = 0x18;
-    bool learned = false;
+    uintptr_t nsOff = 0;
+    bool apiNames = true;
+    int probes = 0;
+    for (uintptr_t image : g.images.all) {
+        if (!apiNames || probes >= 6) break;
+        uintptr_t count = 0;
+        if (!remote_session_call(s, g.il2.sym_image_get_class_count, {image}, count)) continue;
+        const size_t n = std::min((size_t)count, (size_t)6);
+        for (size_t i = 0; i < n && probes < 6; ++i) {
+            uintptr_t klass = 0;
+            if (!remote_session_call(s, g.il2.sym_image_get_class, {image, i}, klass) || !klass)
+                continue;
+            ++probes;
+            if (learn_name_offs(s, klass, nameOff, nsOff)) apiNames = false;
+        }
+    }
     for (uintptr_t image : g.images.all) {
         uintptr_t count = 0;
         if (!remote_session_call(s, g.il2.sym_image_get_class_count, {image}, count)) continue;
@@ -310,12 +344,8 @@ void ensure_index(RemoteSession &s) {
             uintptr_t klass = 0;
             if (!remote_session_call(s, g.il2.sym_image_get_class, {image, i}, klass) || !klass)
                 continue;
-            if (!learned) {
-                learn_name_offs(s, klass, nameOff, nsOff);
-                learned = true;
-            }
             std::string full;
-            if (!read_indexed_name(klass, nameOff, nsOff, full)) continue;
+            if (!read_indexed_name(s, klass, nameOff, nsOff, apiNames, full)) continue;
             g.index.push_back(ClassRec{klass, std::move(full), iname});
         }
     }
@@ -329,45 +359,13 @@ Found find_classes(RemoteSession &s, const char *fullName) {
     std::string ns, cls;
     split_name(query, ns, cls);
     if (cls.empty()) return found;
-
-    auto consider = [&](uintptr_t image, const char *tryNs) {
-        if (found.hits.size() >= 4) return;
-        const uintptr_t klass = class_from_name(s, image, tryNs ? tryNs : "", cls);
-        if (!mem_ptr_ok(klass)) return;
-        std::string full = (tryNs && tryNs[0]) ? std::string(tryNs) + "." + cls : cls;
-        keep_hit(found, Hit{klass, std::move(full), image_name(s, image), 3});
-    };
-
-    const char *guessNs[] = {"", "UnityEngine", "UnityEngine.UI", "System"};
-    std::vector<uintptr_t> order;
-    if (g.images.unityCore) order.push_back(g.images.unityCore);
-    if (g.images.assemblyCSharp) order.push_back(g.images.assemblyCSharp);
-    for (uintptr_t image : g.images.all) {
-        bool seen = false;
-        for (uintptr_t x : order)
-            if (x == image) seen = true;
-        if (!seen) order.push_back(image);
-    }
-    for (uintptr_t image : order) {
-        if (!ns.empty())
-            consider(image, ns.c_str());
-        else {
-            for (const char *gns : guessNs) {
-                consider(image, gns);
-                if (!found.hits.empty()) break;
-            }
-        }
-        if (!found.hits.empty()) break;
-    }
-    if (found.hits.empty()) {
-        ensure_index(s);
-        found.scanned = g.index.size();
-        found.images = g.indexImages;
-        for (const ClassRec &rec : g.index) {
-            const int rank = type_rank(rec.full, query);
-            if (!rank) continue;
-            keep_hit(found, Hit{rec.klass, rec.full, rec.image, rank});
-        }
+    if (!g.indexReady) ensure_index(s);
+    found.scanned = g.index.size();
+    found.images = g.indexImages;
+    for (const ClassRec &rec : g.index) {
+        const int rank = type_rank(rec.full, query);
+        if (!rank) continue;
+        keep_hit(found, Hit{rec.klass, rec.full, rec.image, rank});
     }
     std::sort(found.hits.begin(), found.hits.end(), [](const Hit &a, const Hit &b) {
         if (a.rank != b.rank) return a.rank > b.rank;
@@ -746,14 +744,15 @@ int ax_attach(int pid, char *out, size_t cap) {
         remote_session_call(s, g.il2.sym_thread_attach, {domain}, thr);
     }
     collect_images(s);
-    remote_session_end(s);
     resolve_extra_syms();
+    ensure_index(s);
+    remote_session_end(s);
     g.ready = true;
     char buf[512];
     std::snprintf(buf, sizeof(buf),
-                  "pid %d\nlib %s\nbase 0x%llx\ndomain 0x%llx\nimages %zu\nready",
+                  "pid %d\nlib %s\nbase 0x%llx\ndomain 0x%llx\nimages %zu\nclasses %zu\nready",
                   pid, g.il2.libBaseName, (unsigned long long)g.il2.base,
-                  (unsigned long long)domain, g.images.all.size());
+                  (unsigned long long)domain, g.images.all.size(), g.index.size());
     return put_text(out, cap, buf);
 }
 
@@ -773,12 +772,12 @@ int ax_search(const char *query, char *out, size_t cap) {
         if (found.hits.empty()) {
             char line[192];
             std::snprintf(line, sizeof(line),
-                          "not found: %s\nfull scan %zu classes in %zu images",
+                          "not found: %s\nindex %zu classes in %zu images",
                           q.c_str(), found.scanned, found.images);
             text = line;
         } else {
             char head[160];
-            std::snprintf(head, sizeof(head), "matches %zu\nfull scan %zu classes in %zu images\n",
+            std::snprintf(head, sizeof(head), "matches %zu\nindex %zu classes in %zu images\n",
                           found.hits.size(), found.scanned, found.images);
             text = head;
             int detailed = 0;
