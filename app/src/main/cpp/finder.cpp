@@ -51,18 +51,35 @@ uintptr_t scratch_cstr(RemoteSession &s, pid_t pid, int slot, const char *lit) {
 }
 
 bool read_remote_cstr(pid_t pid, uintptr_t p, char *buf, size_t n) {
-    if (!buf || n == 0) return false;
+    if (!buf || n < 2) return false;
     buf[0] = '\0';
-    if (!mem_ptr_ok(p) || !mem_read(pid, p, buf, n - 1)) return false;
-    buf[n - 1] = '\0';
-    for (size_t i = 0; i < n; ++i) {
-        if (buf[i] == '\0') return i > 0;
-        const unsigned char c = (unsigned char)buf[i];
-        if (c < 0x20 || c > 0x7e) {
-            buf[0] = '\0';
-            return false;
+    if (!mem_ptr_ok(p)) return false;
+    size_t filled = 0;
+    const size_t limit = std::min(n - 1, (size_t)160);
+    while (filled < limit) {
+        const uintptr_t addr = p + filled;
+        size_t chunk = limit - filled;
+        const uintptr_t pageLeft = 0x1000u - (addr & 0xFFFu);
+        if (chunk > pageLeft) chunk = (size_t)pageLeft;
+        if (chunk > 32) chunk = 32;
+        if (!chunk || !mem_read(pid, addr, buf + filled, chunk)) {
+            if (!filled) return false;
+            break;
         }
+        for (size_t i = 0; i < chunk; ++i) {
+            const unsigned char c = (unsigned char)buf[filled + i];
+            if (c == '\0') {
+                buf[filled + i] = '\0';
+                return filled + i > 0;
+            }
+            if (c < 0x20 || c > 0x7e) {
+                buf[0] = '\0';
+                return false;
+            }
+        }
+        filled += chunk;
     }
+    buf[0] = '\0';
     return false;
 }
 
@@ -126,22 +143,36 @@ bool read_ns_name(pid_t pid, uintptr_t klass, char *ns, size_t nsn, char *name, 
     return false;
 }
 
-bool class_matches(uintptr_t klass, const std::string &wantNs, const std::string &wantCls,
-                   const std::string &wantFull) {
-    char name[128] = {};
-    char ns[128] = {};
-    if (!read_ns_name(g.pid, klass, ns, sizeof(ns), name, sizeof(name))) {
-        if (!klass_name_at(g.pid, klass, name, sizeof(name))) return false;
-    }
+bool call_cstr(RemoteSession &s, uintptr_t fn, uintptr_t arg, char *buf, size_t n);
+
+bool name_hit(const char *name, const char *ns, const std::string &wantNs, const std::string &wantCls,
+              const std::string &wantFull) {
+    if (!name || !name[0]) return false;
     if (eq_ci(name, wantFull) || eq_ci(name, wantCls)) {
-        if (!wantNs.empty() && ns[0] && !eq_ci(ns, wantNs)) return false;
+        if (!wantNs.empty() && ns && ns[0] && !eq_ci(ns, wantNs)) return false;
         return true;
     }
-    std::string full = ns[0] ? std::string(ns) + "." + name : std::string(name);
+    std::string full = (ns && ns[0]) ? std::string(ns) + "." + name : std::string(name);
     if (eq_ci(full.c_str(), wantFull) || eq_ci(full.c_str(), wantCls)) return true;
     for (char &c : full)
         if (c == '/' || c == '+') c = '.';
     return eq_ci(full.c_str(), wantFull);
+}
+
+bool class_matches(RemoteSession &s, uintptr_t klass, const std::string &wantNs,
+                   const std::string &wantCls, const std::string &wantFull) {
+    char name[128] = {};
+    char ns[128] = {};
+    if (g.sym_class_get_name &&
+        call_cstr(s, g.sym_class_get_name, klass, name, sizeof(name))) {
+        if (g.sym_class_get_namespace)
+            call_cstr(s, g.sym_class_get_namespace, klass, ns, sizeof(ns));
+        return name_hit(name, ns, wantNs, wantCls, wantFull);
+    }
+    if (!read_ns_name(g.pid, klass, ns, sizeof(ns), name, sizeof(name)) &&
+        !klass_name_at(g.pid, klass, name, sizeof(name)))
+        return false;
+    return name_hit(name, ns, wantNs, wantCls, wantFull);
 }
 
 struct Found {
@@ -172,7 +203,7 @@ void scan_images(RemoteSession &s, const std::string &wantNs, const std::string 
             if (!remote_session_call(s, g.il2.sym_image_get_class, {image, i}, klass) || !klass)
                 continue;
             ++found.scanned;
-            if (class_matches(klass, wantNs, wantCls, wantFull)) keep_klass(found, klass);
+            if (class_matches(s, klass, wantNs, wantCls, wantFull)) keep_klass(found, klass);
             if (found.klasses.size() >= 8) break;
         }
     }
@@ -184,13 +215,29 @@ Found find_classes(RemoteSession &s, const char *fullName) {
     const std::string full = fullName ? fullName : "";
     split_name(full, ns, cls);
     if (cls.empty()) return found;
+    const char *guessNs[] = {"UnityEngine",
+                             "UnityEngine.UI",
+                             "UnityEngine.Events",
+                             "UnityEngine.Rendering",
+                             "System",
+                             "System.Collections.Generic",
+                             "Cinemachine",
+                             "TMPro",
+                             ""};
     auto try_image = [&](uintptr_t image) {
-        if (!image) return;
-        keep_klass(found, class_from_name(s, image, ns, cls));
-        if (!ns.empty()) keep_klass(found, class_from_name(s, image, "", cls));
+        if (!image || found.klasses.size() >= 8) return;
+        if (!ns.empty()) {
+            keep_klass(found, class_from_name(s, image, ns, cls));
+            keep_klass(found, class_from_name(s, image, "", cls));
+            return;
+        }
+        for (const char *gns : guessNs) {
+            if (found.klasses.size() >= 8) break;
+            keep_klass(found, class_from_name(s, image, gns, cls));
+        }
     };
-    try_image(g.images.assemblyCSharp);
     try_image(g.images.unityCore);
+    try_image(g.images.assemblyCSharp);
     for (uintptr_t image : g.images.all) try_image(image);
     if (found.klasses.empty()) scan_images(s, ns, cls, full, found);
     return found;
