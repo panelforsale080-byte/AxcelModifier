@@ -210,6 +210,42 @@ std::string describe(RemoteSession &s, uintptr_t klass) {
     return out;
 }
 
+std::string search_by_address(RemoteSession &s, uintptr_t raw) {
+    const uintptr_t base = g.il2.base;
+    const uintptr_t span = (g.il2.end > base) ? (g.il2.end - base) : 0;
+    uintptr_t addr = raw;
+    bool fromBase = false;
+    if (base && raw < 0x100000000ULL && (span == 0 || raw < span)) {
+        addr = base + raw;
+        fromBase = true;
+    }
+    char math[192];
+    if (fromBase) {
+        std::snprintf(math, sizeof(math), "il2cpp + 0x%llx = 0x%llx\n",
+                      (unsigned long long)raw, (unsigned long long)addr);
+    } else if (base && addr >= base && span && addr < base + span) {
+        std::snprintf(math, sizeof(math), "il2cpp + 0x%llx = 0x%llx\n",
+                      (unsigned long long)(addr - base), (unsigned long long)addr);
+    } else {
+        std::snprintf(math, sizeof(math), "address 0x%llx\nlib base 0x%llx\n",
+                      (unsigned long long)addr, (unsigned long long)base);
+    }
+    std::string body = describe(s, addr);
+    if (body.find("not an Il2CppClass") != std::string::npos) {
+        uintptr_t pointed = 0;
+        if (mem_read(g.pid, addr, pointed) && mem_ptr_ok(pointed)) {
+            std::string nested = describe(s, pointed);
+            if (nested.find("not an Il2CppClass") == std::string::npos) {
+                char hop[96];
+                std::snprintf(hop, sizeof(hop), "pointer -> klass 0x%llx\n",
+                              (unsigned long long)pointed);
+                return std::string(math) + hop + nested;
+            }
+        }
+    }
+    return std::string(math) + body;
+}
+
 bool looks_like_offset(const std::string &q) {
     if (q.size() < 3) return false;
     size_t i = 0;
@@ -388,18 +424,7 @@ int ax_search(const char *query, char *out, size_t cap) {
     std::string text;
     if (looks_like_offset(q)) {
         const uintptr_t raw = (uintptr_t)std::strtoull(q.c_str(), nullptr, 0);
-        uintptr_t klass = 0;
-        if (mem_ptr_ok(raw)) klass = raw;
-        else if (g.il2.base && g.il2.end > g.il2.base && raw < (g.il2.end - g.il2.base))
-            klass = g.il2.base + raw;
-        text = describe(s, klass);
-        if (text.find("not an Il2CppClass") != std::string::npos) {
-            char extra[160];
-            std::snprintf(extra, sizeof(extra),
-                          "\n%s is not a class pointer. Search the class name to list field offsets.",
-                          q.c_str());
-            text += extra;
-        }
+        text = search_by_address(s, raw);
     } else {
         const uintptr_t klass = find_class(s, q.c_str());
         if (!klass)

@@ -50,7 +50,7 @@ public class MainActivity extends Activity {
         root.addView(status);
 
         query = new EditText(this);
-        query.setHint("Class name or 0x offset");
+        query.setHint("Class name or il2cpp offset 0x208020");
         query.setTextColor(Color.parseColor("#F2F2F7"));
         query.setHintTextColor(Color.parseColor("#8E8E93"));
         query.setInputType(InputType.TYPE_CLASS_TEXT);
